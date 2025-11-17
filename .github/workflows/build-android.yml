@@ -1,5 +1,5 @@
-# Improved GitHub Actions workflow for building Phira Android APK
-# This version addresses common build issues and provides better error handling
+# Fixed GitHub Actions workflow for building Phira Android APK
+# Targets the specific workspace member instead of virtual manifest
 
 name: Build Phira Android APK (Fixed)
 
@@ -24,6 +24,11 @@ on:
         options:
           - release
           - debug
+      package_name:
+        description: 'Workspace member to build (usually phira-main)'
+        required: false
+        default: 'phira-main'
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -84,21 +89,80 @@ jobs:
           echo "Installing cargo-apk..."
           cargo install cargo-apk --force
           
-      - name: Check project structure
+      - name: Check project structure and identify Android target
+        id: project_check
         run: |
           echo "Checking project structure..."
           echo "Current directory: $(pwd)"
-          echo "Directory contents:"
-          ls -la
           
-          echo "Checking for Cargo.toml files:"
-          find . -name "Cargo.toml" -type f | head -10
+          echo "=== Workspace members ==="
+          cat Cargo.toml | grep -A 20 "members"
           
-          echo "Checking workspace structure:"
-          if [ -f "Cargo.toml" ]; then
-            echo "Root Cargo.toml exists"
-            cat Cargo.toml | grep -A 10 "members"
+          echo "=== Checking specified package: ${{ github.event.inputs.package_name }} ==="
+          if [ -d "${{ github.event.inputs.package_name }}" ] && [ -f "${{ github.event.inputs.package_name }}/Cargo.toml" ]; then
+            echo "Package exists: ${{ github.event.inputs.package_name }}"
+            
+            echo "=== Package manifest ==="
+            cat ${{ github.event.inputs.package_name }}/Cargo.toml
+            
+            # Check for Android metadata
+            if grep -q "package.metadata.android" "${{ github.event.inputs.package_name }}/Cargo.toml"; then
+              echo "Android metadata found in package manifest"
+              echo "android_ready=true" >> $GITHUB_OUTPUT
+            else
+              echo "No Android metadata found - will need to add it"
+              echo "android_ready=false" >> $GITHUB_OUTPUT
+            fi
+            
+            # Get package name from Cargo.toml
+            PKG_NAME=$(grep '^name' "${{ github.event.inputs.package_name }}/Cargo.toml" | head -1 | cut -d'"' -f2)
+            echo "package_name=$PKG_NAME" >> $GITHUB_OUTPUT
+            echo "Detected package name: $PKG_NAME"
+          else
+            echo "Package ${{ github.event.inputs.package_name }} not found!"
+            echo "Available packages:"
+            ls -d */ | grep -E "(phira|main|android)" || ls -d */
+            echo "package_name=unknown" >> $GITHUB_OUTPUT
+            echo "android_ready=false" >> $GITHUB_OUTPUT
           fi
+          
+      - name: Add Android metadata if missing
+        if: steps.project_check.outputs.android_ready == 'false' && steps.project_check.outputs.package_name != 'unknown'
+        run: |
+          echo "Adding Android metadata to package manifest..."
+          cd "${{ github.event.inputs.package_name }}"
+          
+          # Backup original
+          cp Cargo.toml Cargo.toml.backup
+          
+          # Add Android metadata section
+          cat >> Cargo.toml << 'EOF'
+          
+          [package.metadata.android]
+          package_name = "com.phira.game"
+          version_code = 1
+          version_name = "0.6.7"
+          
+          [package.metadata.android.sdk]
+          min_sdk_version = 21
+          target_sdk_version = 33
+          
+          [package.metadata.android.activity]
+          orientation = "landscape"
+          config_changes = "orientation|keyboardHidden|screenSize"
+          
+          [[package.metadata.android.permission]]
+          name = "android.permission.INTERNET"
+          
+          [[package.metadata.android.permission]]
+          name = "android.permission.ACCESS_NETWORK_STATE"
+          
+          [lib]
+          crate-type = ["cdylib"]
+          EOF
+          
+          echo "Updated manifest:"
+          cat Cargo.toml
           
       - name: Configure cargo for Android
         run: |
@@ -120,249 +184,175 @@ jobs:
           echo "Cargo config created:"
           cat .cargo/config.toml
           
-      - name: Try building with cargo-apk
+      - name: Build APK with cargo-apk (corrected approach)
         id: build_apk
-        continue-on-error: true
         run: |
-          echo "Attempting to build APK with cargo-apk..."
+          echo "Building APK for package: ${{ steps.project_check.outputs.package_name }}"
           echo "Features: ${{ github.event.inputs.features }}"
           echo "Build mode: ${{ github.event.inputs.build_mode }}"
+          echo "Target: aarch64-linux-android"
           
-          # Try to build the APK
-          if cargo apk build --features "${{ github.event.inputs.features }}" --target aarch64-linux-android --${{ github.event.inputs.build_mode }}; then
+          # Build the specific package with cargo-apk
+          # Use -p flag to specify the package name
+          if cargo apk build \
+            -p "${{ steps.project_check.outputs.package_name }}" \
+            --features "${{ github.event.inputs.features }}" \
+            --target aarch64-linux-android \
+            --${{ github.event.inputs.build_mode }}; then
+            
             echo "APK build successful!"
             echo "build_success=true" >> $GITHUB_OUTPUT
+            
+            # Find the APK
+            APK_PATH=$(find . -name "*.apk" -type f 2>/dev/null | head -1 || true)
+            if [ -n "$APK_PATH" ]; then
+              echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "APK build failed, will try alternative approach..."
+            echo "APK build failed!"
             echo "build_success=false" >> $GITHUB_OUTPUT
           fi
           
-      - name: Alternative build - Library only
+      - name: Build Android library as fallback
         if: steps.build_apk.outputs.build_success != 'true'
+        id: build_library
         run: |
-          echo "Attempting alternative build: Android library only..."
+          echo "Attempting to build Android library instead..."
           
-          # Try to build just the Android library
-          if cargo build --features "${{ github.event.inputs.features }}" --target aarch64-linux-android --${{ github.event.inputs.build_mode }}; then
+          # Build the library
+          if cargo build \
+            -p "${{ steps.project_check.outputs.package_name }}" \
+            --features "${{ github.event.inputs.features }}" \
+            --target aarch64-linux-android \
+            --${{ github.event.inputs.build_mode }}; then
+            
             echo "Library build successful!"
+            echo "lib_success=true" >> $GITHUB_OUTPUT
             
-            # Create a simple APK wrapper project
-            echo "Creating APK wrapper project..."
-            mkdir -p android-wrapper
-            cd android-wrapper
-            
-            # Initialize a new cargo apk project
-            cargo apk init --name phira-wrapper
-            
-            # Modify Cargo.toml to include phira as dependency
-            cat > Cargo.toml << EOF
-            [package]
-            name = "phira-wrapper"
-            version = "0.1.0"
-            edition = "2021"
-            
-            [lib]
-            crate-type = ["cdylib"]
-            
-            [dependencies]
-            phira = { path = "../phira", features = ["${{ github.event.inputs.features }}"] }
-            
-            [package.metadata.android]
-            package_name = "com.phira.game"
-            version_code = 1
-            version_name = "1.0"
-            
-            [package.metadata.android.sdk]
-            min_sdk_version = 21
-            target_sdk_version = 33
-            EOF
-            
-            # Create simple lib.rs
-            cat > src/lib.rs << EOF
-            use phira;
-            
-            #[no_mangle]
-            pub extern "C" fn android_main() {
-                phira::main();
-            }
-            EOF
-            
-            # Try to build the wrapper
-            if cargo apk build --${{ github.event.inputs.build_mode }}; then
-              echo "Wrapper APK build successful!"
-              cd ..
-              cp -r android-wrapper/target/android-artifacts/app/build/outputs/apk/${{ github.event.inputs.build_mode }}/*.apk target/ 2>/dev/null || true
-            else
-              echo "Wrapper build also failed"
-              cd ..
+            # Find the library
+            LIB_PATH=$(find target/aarch64-linux-android -name "*.so" -type f 2>/dev/null | head -1 || true)
+            if [ -n "$LIB_PATH" ]; then
+              echo "lib_path=$LIB_PATH" >> $GITHUB_OUTPUT
             fi
           else
-            echo "Library build failed"
+            echo "Library build also failed"
+            echo "lib_success=false" >> $GITHUB_OUTPUT
           fi
           
-      - name: Check build artifacts
-        id: check_artifacts
-        run: |
-          echo "Checking build artifacts..."
-          
-          # Look for APK files
-          APK_FILES=$(find target -name "*.apk" -type f 2>/dev/null || true)
-          
-          if [ -n "$APK_FILES" ]; then
-            echo "Found APK files:"
-            echo "$APK_FILES"
-            
-            # Get the first APK file
-            APK_PATH=$(echo "$APK_FILES" | head -1)
-            echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
-            echo "has_apk=true" >> $GITHUB_OUTPUT
-          else
-            echo "No APK files found"
-            echo "has_apk=false" >> $GITHUB_OUTPUT
-          fi
-          
-          # Check for library files
-          LIB_FILES=$(find target -name "*.so" -type f 2>/dev/null || true)
-          if [ -n "$LIB_FILES" ]; then
-            echo "Found library files:"
-            echo "$LIB_FILES"
-            echo "has_library=true" >> $GITHUB_OUTPUT
-          else
-            echo "No library files found"
-            echo "has_library=false" >> $GITHUB_OUTPUT
-          fi
-          
-      - name: Create output directory and artifacts
+      - name: Prepare build artifacts
         run: |
           mkdir -p output
           
-          if [ "${{ steps.check_artifacts.outputs.has_apk }}" = "true" ]; then
-            echo "Copying APK to output..."
-            cp "${{ steps.check_artifacts.outputs.apk_path }}" output/phira-android.apk
-            
-            # Create info file
-            cat > output/build-info.txt << EOF
-            Phira Android APK Build Information
-            ===================================
-            
-            Build Date: $(date)
-            Features: ${{ github.event.inputs.features }}
-            Target: aarch64-linux-android
-            Build Mode: ${{ github.event.inputs.build_mode }}
-            
-            Features Description:
-            - chat: Multiplayer chat functionality
-            - video: Video playback support
-            - aa: Android-specific optimizations
-            - event_debug: Debug mode for development
-            
-            Installation:
-            1. Enable "Install from unknown sources" in Android settings
-            2. Download and install the APK file
-            3. Enjoy Phira with chat functionality!
-            
-            Note: This is an unofficial build. Use at your own risk.
-            EOF
-            
-          elif [ "${{ steps.check_artifacts.outputs.has_library }}" = "true" ]; then
-            echo "Creating library package..."
-            
-            # Find the main library
-            MAIN_LIB=$(find target -name "libphira*.so" -type f 2>/dev/null | head -1 || echo "")
-            if [ -n "$MAIN_LIB" ]; then
-              cp "$MAIN_LIB" output/libphira-android.so
+          if [ "${{ steps.build_apk.outputs.build_success }}" = "true" ]; then
+            echo "=== Copying APK ==="
+            APK_PATH="${{ steps.build_apk.outputs.apk_path }}"
+            if [ -f "$APK_PATH" ]; then
+              cp "$APK_PATH" output/phira-android.apk
+              echo "APK copied to output/"
+            else
+              # Try to find APK in standard location
+              find . -name "*.apk" -type f -exec cp {} output/ \; 2>/dev/null || true
             fi
             
-            cat > output/build-info.txt << EOF
-            Phira Android Library Build Information
-            =====================================
+            BUILD_TYPE="APK"
             
-            Build Date: $(date)
-            Features: ${{ github.event.inputs.features }}
-            Target: aarch64-linux-android
-            Build Mode: ${{ github.event.inputs.build_mode }}
+          elif [ "${{ steps.build_library.outputs.lib_success }}" = "true" ]; then
+            echo "=== Copying library ==="
+            LIB_PATH="${{ steps.build_library.outputs.lib_path }}"
+            if [ -f "$LIB_PATH" ]; then
+              cp "$LIB_PATH" output/libphira.so
+              echo "Library copied to output/"
+            else
+              # Find all .so files
+              find target -name "*.so" -type f -exec cp {} output/ \; 2>/dev/null || true
+            fi
             
-            This build produced Android native libraries instead of a complete APK.
+            BUILD_TYPE="LIBRARY"
             
-            Files included:
-            - libphira-android.so: The main Phira library
-            
-            To create a complete APK, you would need to:
-            1. Create an Android wrapper project
-            2. Include this library
-            3. Use cargo-apk to build the final APK
-            
-            Features enabled:
-            ${{ github.event.inputs.features }}
-            
-            Note: This is an unofficial build. Use at your own risk.
-            EOF
           else
-            echo "No build artifacts found!"
-            cat > output/build-failed.txt << EOF
-            Phira Android Build Failed
-            ==========================
-            
-            Build Date: $(date)
-            Features: ${{ github.event.inputs.features }}
-            Target: aarch64-linux-android
-            Build Mode: ${{ github.event.inputs.build_mode }}
-            
-            The build process failed to produce any artifacts.
-            
-            Possible issues:
-            1. Project structure incompatibility
-            2. Dependency conflicts
-            3. Android configuration issues
-            4. Build system limitations
-            
-            Please check the GitHub Actions logs for detailed error information.
-            
-            Alternative approaches:
-            1. Try different feature combinations
-            2. Use debug build mode instead of release
-            3. Check if the project has Android support
-            4. Consider local build with proper Android setup
-            EOF
+            echo "=== Build failed ==="
+            BUILD_TYPE="FAILED"
           fi
+          
+          # Create build info
+          cat > output/build-info.txt << EOF
+          Phira Android Build Report
+          ==========================
+          
+          Build Date: $(date)
+          Package: ${{ steps.project_check.outputs.package_name }}
+          Features: ${{ github.event.inputs.features }}
+          Build Mode: ${{ github.event.inputs.build_mode }}
+          Target: aarch64-linux-android
+          
+          Build Status: $BUILD_TYPE
+          
+          ${{ steps.build_apk.outputs.build_success == 'true' && '✅ APK Build: SUCCESS' || format('❌ APK Build: FAILED ({0})', steps.build_library.outputs.lib_success == 'true' && 'Library only' || 'Complete failure') }}
+          
+          Workspace Structure:
+          - Virtual workspace manifest detected at root
+          - Built package member: ${{ github.event.inputs.package_name }}
+          
+          ${{ steps.build_apk.outputs.build_success == 'true' && 'The APK is ready for installation on Android devices.' || format('Build output: {0}', steps.build_library.outputs.lib_success == 'true' && 'Native libraries (.so files) were built successfully, but APK generation failed.' || 'No build artifacts were produced.') }}
+          
+          ${{ steps.build_apk.outputs.build_success != 'true' && 'Troubleshooting:' || '' }}
+          ${{ steps.build_apk.outputs.build_success != 'true' && '- Ensure the selected package has proper [package.metadata.android] configuration' || '' }}
+          ${{ steps.build_apk.outputs.build_success != 'true' && '- Check that the package contains Android-specific code and resources' || '' }}
+          ${{ steps.build_apk.outputs.build_success != 'true' && '- Verify all Android dependencies are correctly configured' || '' }}
+          
+          Note: This is an unofficial build. Use at your own risk.
+          EOF
+          
+          echo "Build info created"
+          cat output/build-info.txt
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: phira-android-build-${{ github.event.inputs.features }}-${{ github.event.inputs.build_mode }}
+          name: phira-android-${{ github.event.inputs.package_name }}-${{ github.event.inputs.features }}-${{ github.event.inputs.build_mode }}-${{ github.run_number }}
           path: output/*
           retention-days: 30
           
-      - name: Create summary
+      - name: Summary
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Date**: $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Features**: ${{ github.event.inputs.features }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Target**: aarch64-linux-android" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build Mode**: ${{ github.event.inputs.build_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 📱 Phira Android Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Package**: ${{ steps.project_check.outputs.package_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Features**: ${{ github.event.inputs.features }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Mode**: ${{ github.event.inputs.build_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target**: aarch64-linux-android" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ steps.check_artifacts.outputs.has_apk }}" = "true" ]; then
-            echo "✅ **Build Status**: APK successfully created!" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.build_apk.outputs.build_success }}" = "true" ]; then
+            echo "✅ **Build Status**: APK Successfully Created!" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 📱 APK Ready" >> $GITHUB_STEP_SUMMARY
-            echo "Your Phira Android APK is ready for download!" >> $GITHUB_STEP_SUMMARY
+            echo "### 📥 Download" >> $GITHUB_STEP_SUMMARY
+            echo "Your Phira Android APK is available in the build artifacts." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Features enabled**: ${{ github.event.inputs.features }}" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ steps.check_artifacts.outputs.has_library }}" = "true" ]; then
-            echo "⚠️ **Build Status**: Library built, but APK generation failed" >> $GITHUB_STEP_SUMMARY
+            echo "### 🎯 Installation" >> $GITHUB_STEP_SUMMARY
+            echo "1. Download \`phira-android.apk\` from artifacts" >> $GITHUB_STEP_SUMMARY
+            echo "2. Enable \"Install from unknown sources\" on your Android device" >> $GITHUB_STEP_SUMMARY
+            echo "3. Install and enjoy Phira with ${{ github.event.inputs.features }} features!" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.build_library.outputs.lib_success }}" = "true" ]; then
+            echo "⚠️ **Build Status**: Partial Success (Library Only)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 📚 Library Available" >> $GITHUB_STEP_SUMMARY
-            echo "Android native library was successfully built." >> $GITHUB_STEP_SUMMARY
-            echo "Check the build artifacts for the library files." >> $GITHUB_STEP_SUMMARY
+            echo "### 📚 What was built:" >> $GITHUB_STEP_SUMMARY
+            echo "- Native Android libraries (\`.so\` files) were successfully compiled" >> $GITHUB_STEP_SUMMARY
+            echo "- APK packaging failed (missing Android metadata or resources)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔧 To fix APK generation:" >> $GITHUB_STEP_SUMMARY
+            echo "- Ensure \`[package.metadata.android]\` section exists in package Cargo.toml" >> $GITHUB_STEP_SUMMARY
+            echo "- Verify Android resource files are present" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **Build Status**: Build failed" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Build Status**: Build Failed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 🔧 Troubleshooting" >> $GITHUB_STEP_SUMMARY
-            echo "The build failed to produce artifacts." >> $GITHUB_STEP_SUMMARY
-            echo "Check the build logs for detailed error information." >> $GITHUB_STEP_SUMMARY
+            echo "### 🔍 Possible causes:" >> $GITHUB_STEP_SUMMARY
+            echo "- Incorrect workspace member selected" >> $GITHUB_STEP_SUMMARY
+            echo "- Missing Android support in the codebase" >> $GITHUB_STEP_SUMMARY
+            echo "- Compilation errors in the source code" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📋 Next steps:" >> $GITHUB_STEP_SUMMARY
+            echo "- Check the detailed build logs above" >> $GITHUB_STEP_SUMMARY
+            echo "- Verify the correct package name (try \`phira\` or \`phira-main\`)" >> $GITHUB_STEP_SUMMARY
+            echo "- Ensure all dependencies are compatible with Android" >> $GITHUB_STEP_SUMMARY
           fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📥 Download" >> $GITHUB_STEP_SUMMARY
-          echo "Check the uploaded artifacts for build results." >> $GITHUB_STEP_SUMMARY
