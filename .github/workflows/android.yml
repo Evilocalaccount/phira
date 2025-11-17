@@ -1,0 +1,221 @@
+name: Build Phira Android APK (Fixed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      features:
+        description: 'Features to enable'
+        required: false
+        default: 'chat'
+        type: choice
+        options:
+          - chat
+          - chat,video
+          - chat,video,aa
+          - chat,video,aa,event_debug
+      build_mode:
+        description: 'Build mode'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      target_package:
+        description: 'Package to build'
+        required: false
+        default: 'phira'
+        type: choice
+        options:
+          - phira        # Likely contains the actual game logic
+          - phira-main   # Main entry point (may need patching)
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: TeamFlos/phira
+          ref: main
+          
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            **/target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Setup Android environment
+        run: |
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+          unzip -q commandlinetools-linux-9477386_latest.zip
+          mkdir -p android-sdk/cmdline-tools
+          mv cmdline-tools android-sdk/cmdline-tools/latest
+          
+          export ANDROID_HOME=$PWD/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+          
+          (yes || true) | sdkmanager --licenses
+          sdkmanager --install "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
+          
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+          
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked --force
+          
+      - name: Analyze and patch package
+        id: analysis
+        run: |
+          PKG="${{ github.event.inputs.target_package }}"
+          echo "Target: $PKG"
+          
+          # Check package exists
+          if [ ! -f "$PKG/Cargo.toml" ]; then
+            echo "Package not found!"
+            exit 1
+          fi
+          
+          cd $PKG
+          
+          # Extract package name
+          PKG_NAME=$(grep '^name' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "pkg_name=$PKG_NAME" >> $GITHUB_OUTPUT
+          
+          # Check for required sections
+          HAS_LIB=$(grep -q 'crate-type.*cdylib' Cargo.toml && echo "true" || echo "false")
+          HAS_ANDROID=$(grep -q 'package.metadata.android' Cargo.toml && echo "true" || echo "false")
+          
+          echo "Has lib: $HAS_LIB | Has Android: $HAS_ANDROID"
+          
+          # Patch if needed
+          if [ "$HAS_LIB" = "false" ] || [ "$HAS_ANDROID" = "false" ]; then
+            echo "Patching Cargo.toml..."
+            
+            # Backup
+            cp Cargo.toml Cargo.toml.backup
+            
+            # Add [lib] section if missing
+            if [ "$HAS_LIB" = "false" ]; then
+              cat >> Cargo.toml << 'EOF'
+          
+          [lib]
+          crate-type = ["cdylib"]
+          name = "phira_android"
+          EOF
+            fi
+            
+            # Add Android metadata if missing
+            if [ "$HAS_ANDROID" = "false" ]; then
+              cat >> Cargo.toml << 'EOF'
+          
+          [package.metadata.android]
+          package_name = "com.phira.game"
+          version_code = 1
+          version_name = "0.6.7"
+          
+          [package.metadata.android.sdk]
+          min_sdk_version = 21
+          target_sdk_version = 33
+          
+          [package.metadata.android.activity]
+          orientation = "landscape"
+          config_changes = "orientation|keyboardHidden|screenSize"
+          
+          [[package.metadata.android.permission]]
+          name = "android.permission.INTERNET"
+          
+          [[package.metadata.android.permission]]
+          name = "android.permission.ACCESS_NETWORK_STATE"
+          EOF
+            fi
+          fi
+          
+      - name: Configure cargo
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml << 'EOF'
+          [build]
+          target = "aarch64-linux-android"
+          
+          [target.aarch64-linux-android]
+          ar = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          linker = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          
+          [unstable]
+          build-std = true
+          EOF
+          
+      - name: Build APK
+        id: build_apk
+        run: |
+          echo "Building ${{ steps.analysis.outputs.pkg_name }}..."
+          
+          if cargo apk build \
+            -p "${{ steps.analysis.outputs.pkg_name }}" \
+            --features "${{ github.event.inputs.features }}" \
+            --target aarch64-linux-android \
+            --${{ github.event.inputs.build_mode }}; then
+            
+            echo "build_success=true" >> $GITHUB_OUTPUT
+            
+            # Find APK
+            APK=$(find . -path "*/android-artifacts/**/*.apk" -type f 2>/dev/null | head -1 || \
+                  find . -name "*.apk" -type f 2>/dev/null | head -1 || echo "")
+            echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          else
+            echo "build_success=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Build library fallback
+        if: steps.build_apk.outputs.build_success != 'true'
+        run: |
+          cargo build \
+            -p "${{ steps.analysis.outputs.pkg_name }}" \
+            --features "${{ github.event.inputs.features }}" \
+            --target aarch64-linux-android \
+            --${{ github.event.inputs.build_mode }}
+            
+      - name: Prepare artifacts
+        run: |
+          mkdir -p output
+          
+          # Copy APK if built
+          if [ -f "${{ steps.build_apk.outputs.apk_path }}" ]; then
+            cp "${{ steps.build_apk.outputs.apk_path }}" output/phira.apk
+          fi
+          
+          # Copy libraries if they exist
+          find . -name "*.so" -type f -exec cp {} output/ \; 2>/dev/null || true
+          
+          # Create build info
+          cat > output/build-info.txt << EOF
+          Build Report
+          ============
+          Package: ${{ steps.analysis.outputs.pkg_name }}
+          Features: ${{ github.event.inputs.features }}
+          Mode: ${{ github.event.inputs.build_mode }}
+          Status: ${{ steps.build_apk.outputs.build_success == 'true' && 'APK Success' || steps.build_lib.outputs.lib_success == 'true' && 'Library Only' || 'Failed' }}
+          EOF
+          
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: phira-android-${{ github.event.inputs.target_package }}-${{ github.event.inputs.features }}-${{ github.event.inputs.build_mode }}
+          path: output/
+          retention-days: 30
