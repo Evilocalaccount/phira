@@ -1,0 +1,151 @@
+# GitHub Actions workflow to build Phira Android APK with chat feature
+
+name: Build Phira Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      features:
+        description: 'Features to enable (comma-separated)'
+        required: false
+        default: 'chat'
+        type: string
+      target:
+        description: 'Android target architecture'
+        required: false
+        default: 'aarch64-linux-android'
+        type: choice
+        options:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+      build_mode:
+        description: 'Build mode'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/25.2.9519653
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: TeamFlos/phira
+          ref: main
+          
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ github.event.inputs.target }}
+          
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 33
+          ndk-version: r25c
+          
+      - name: Install cargo-apk
+        run: cargo install cargo-apk
+        
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+            
+      - name: Build Android APK
+        run: |
+          echo "Building Phira Android APK..."
+          echo "Features: ${{ github.event.inputs.features }}"
+          echo "Target: ${{ github.event.inputs.target }}"
+          echo "Build mode: ${{ github.event.inputs.build_mode }}"
+          
+          # Create .cargo/config.toml for Android target
+          mkdir -p .cargo
+          cat > .cargo/config.toml << EOF
+          [build]
+          target = "${{ github.event.inputs.target }}"
+          
+          [target.${{ github.event.inputs.target }}]
+          ar = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          linker = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ github.event.inputs.target }}21-clang"
+          EOF
+          
+          # Build the APK
+          cargo apk build --features "${{ github.event.inputs.features }}" --target ${{ github.event.inputs.target }} --${{ github.event.inputs.build_mode }}
+          
+      - name: Find and rename APK
+        id: find_apk
+        run: |
+          APK_PATH=$(find target/android-artifacts -name "*.apk" -type f | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "No APK found!"
+            exit 1
+          fi
+          
+          # Create output filename with features and build info
+          FEATURES_NAME=$(echo "${{ github.event.inputs.features }}" | tr ',' '-')
+          OUTPUT_NAME="phira-android-${FEATURES_NAME}-${{ github.event.inputs.target }}-${{ github.event.inputs.build_mode }}.apk"
+          
+          echo "APK_PATH=$APK_PATH" >> $GITHUB_OUTPUT
+          echo "OUTPUT_NAME=$OUTPUT_NAME" >> $GITHUB_OUTPUT
+          
+          echo "Found APK: $APK_PATH"
+          echo "Output name: $OUTPUT_NAME"
+          
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.find_apk.outputs.OUTPUT_NAME }}
+          path: ${{ steps.find_apk.outputs.APK_PATH }}
+          retention-days: 30
+          
+      - name: Create release
+        if: github.event.inputs.build_mode == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Phira Android ${{ github.event.inputs.features }} (${{ github.event.inputs.target }})
+          body: |
+            ## Phira Android APK
+            
+            **Features**: ${{ github.event.inputs.features }}
+            **Target**: ${{ github.event.inputs.target }}
+            **Build Mode**: ${{ github.event.inputs.build_mode }}
+            
+            ### Features
+            - `chat`: Multiplayer chat functionality
+            - `video`: Video playback support
+            - `aa`: Android-specific optimizations
+            - `event_debug`: Debug mode for development
+            
+            ### Installation
+            1. Enable "Install from unknown sources" in Android settings
+            2. Download the APK file
+            3. Tap the APK file to install
+            
+            ### Notes
+            - This is an unofficial build
+            - Use at your own risk
+            - For development/testing purposes
+          files: ${{ steps.find_apk.outputs.APK_PATH }}
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
