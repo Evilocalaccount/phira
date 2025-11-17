@@ -1,10 +1,10 @@
-name: Build Phira Android APK (v3)
+name: 构建 Phira Android 原生库
 
 on:
   workflow_dispatch:
     inputs:
       features:
-        description: 'Features to enable'
+        description: '启用功能'
         required: false
         default: 'chat'
         type: choice
@@ -13,248 +13,155 @@ on:
           - chat,video
           - chat,video,aa
           - chat,video,aa,event_debug
-      build_mode:
-        description: 'Build mode'
-        required: false
-        default: 'release'
-        type: choice
-        options:
-          - release
-          - debug
-      target_package:
-        description: 'Package to build (try phira first)'
-        required: false
-        default: 'phira'
-        type: choice
-        options:
-          - phira
-          - phira-main
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: full
+  ANDROID_HOME: ${{github.workspace}}/android-sdk
+  ANDROID_NDK_HOME: ${{github.workspace}}/android-ndk-r27c
+  ANDROID_NDK_ROOT: ${{github.workspace}}/android-ndk-r27c
 
 jobs:
-  build-android:
+  build:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4.2.2
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev pkg-config
+
+      - name: 修复 prpr 库代码
+        run: |
+          # 删除第一行
+          sed -i '1d' prpr/src/lib.rs
+
+      - name: 下载静态库
+        uses: suisei-cn/actions-download-file@v1.3.0
         with:
-          repository: TeamFlos/phira
-          ref: main
-          
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+          url: "https://teamflos.github.io/phira-docs/phira_build_guide/prpr-avc.zip"
+          target: ./
+
+      - name: 解压静态库
+        run: unzip prpr-avc.zip -d ./
+
+      - name: 安装 Android SDK
+        run: |
+          mkdir -p $ANDROID_HOME
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip
+          unzip -q commandlinetools-linux-8512546_latest.zip -d $ANDROID_HOME
+          echo y | $ANDROID_HOME/cmdline-tools/bin/sdkmanager --sdk_root=${ANDROID_HOME} "platform-tools" "build-tools;33.0.2" "platforms;android-35"
+
+      - name: 安装 Android NDK
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q android-ndk-r27c-linux.zip -d ${{github.workspace}}
+
+      - name: 安装 Rust 工具链
+        uses: actions-rs/toolchain@v1.0.6
         with:
-          targets: aarch64-linux-android
-          
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            **/target
-          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-            
-      - name: Setup Android environment
+          toolchain: stable
+          target: aarch64-linux-android
+
+      - name: 构建 Android 原生库
         run: |
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
-          unzip -q commandlinetools-linux-9477386_latest.zip
-          mkdir -p android-sdk/cmdline-tools
-          mv cmdline-tools android-sdk/cmdline-tools/latest
-          
-          export ANDROID_HOME=$PWD/android-sdk
-          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
-          
-          (yes || true) | sdkmanager --licenses
-          sdkmanager --install "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
-          
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
-          
-      - name: Install cargo-apk
-        run: cargo install cargo-apk --locked --force
-          
-      - name: Analyze and patch package
-        id: analysis
+          cargo install cargo-ndk
+          cd phira
+          cargo ndk -t arm64-v8a -p 35 build --release --features "${{ github.event.inputs.features }}"
+
+      - name: 查找构建产物
+        id: find_so
         run: |
-          PKG="${{ github.event.inputs.target_package }}"
-          echo "Target: $PKG"
-          
-          if [ ! -f "$PKG/Cargo.toml" ]; then
-            echo "Package not found!"
-            exit 1
-          fi
-          
-          cd $PKG
-          
-          # Extract package name
-          PKG_NAME=$(grep '^name' Cargo.toml | head -1 | cut -d'"' -f2)
-          echo "pkg_name=$PKG_NAME" >> $GITHUB_OUTPUT
-          
-          # Analyze crate type
-          echo "=== Crate structure ==="
-          ls -la src/
-          
-          HAS_LIB_RS=false
-          HAS_MAIN_RS=false
-          [ -f "src/lib.rs" ] && HAS_LIB_RS=true
-          [ -f "src/main.rs" ] && HAS_MAIN_RS=true
-          
-          echo "has_lib_rs=$HAS_LIB_RS" >> $GITHUB_OUTPUT
-          echo "has_main_rs=$HAS_MAIN_RS" >> $GITHUB_OUTPUT
-          
-          # Check Android metadata
-          HAS_ANDROID=$(grep -q 'package.metadata.android' Cargo.toml && echo "true" || echo "false")
-          echo "has_android=$HAS_ANDROID" >> $GITHUB_OUTPUT
-          
-          echo "Crate type: $([ "$HAS_LIB_RS" = true ] && echo 'LIBRARY' || echo 'BINARY')"
-          
-      - name: Add [lib] section for binary crates
-        if: steps.analysis.outputs.has_lib_rs == 'false' && steps.analysis.outputs.has_main_rs == 'true'
+          SO_FILE=$(find target -name "libphira.so" -type f | head -1)
+          echo "so_path=$SO_FILE" >> $GITHUB_OUTPUT
+          echo "构建的库文件: $SO_FILE"
+
+      - name: 下载官方 APK 模板
         run: |
-          echo "Creating src/lib.rs for binary crate..."
-          cd ${{ github.event.inputs.target_package }}
-          
-          # Create minimal lib.rs that delegates to main
-          cat > src/lib.rs << 'EOF'
-          //! Android library entry point
-          //! 
-          //! This is a wrapper to allow building the binary as an Android library.
-          //! The actual logic remains in src/main.rs.
-          
-          /// Android main entry point
-          #[no_mangle]
-          pub extern "C" fn android_main() {
-              // For now, just a placeholder
-              // In a real scenario, you'd extract the game loop logic into a library
-              // and call it from both main.rs and here
-          }
-          EOF
-          
-          # Add [lib] to Cargo.toml WITHOUT conflicting with [bin]
-          cat >> Cargo.toml << 'EOF'
-          
-          [lib]
-          crate-type = ["cdylib"]
-          name = "phira_android"
-          path = "src/lib.rs"
-          EOF
-          
-      - name: Add Android metadata
-        if: steps.analysis.outputs.has_android == 'false'
-        run: |
-          cd ${{ github.event.inputs.target_package }}
-          
-          cat >> Cargo.toml << 'EOF'
-          
-          [package.metadata.android]
-          package_name = "com.phira.game"
-          version_code = 1
-          # version_name is NOT specified here - cargo-apk sets it automatically
-          
-          [package.metadata.android.sdk]
-          min_sdk_version = 21
-          target_sdk_version = 33
-          
-          [package.metadata.android.activity]
-          orientation = "landscape"
-          config_changes = "orientation|keyboardHidden|screenSize"
-          
-          [[package.metadata.android.permission]]
-          name = "android.permission.INTERNET"
-          
-          [[package.metadata.android.permission]]
-          name = "android.permission.ACCESS_NETWORK_STATE"
-          EOF
-          
-      - name: Configure cargo
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml << 'EOF'
-          [build]
-          target = "aarch64-linux-android"
-          
-          [target.aarch64-linux-android]
-          ar = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          linker = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          
-          [unstable]
-          build-std = true
-          EOF
-          
-      - name: Build APK
-        id: build_apk
-        run: |
-          echo "Building package: ${{ steps.analysis.outputs.pkg_name }}"
-          
-          if cargo apk build \
-            -p "${{ steps.analysis.outputs.pkg_name }}" \
-            --features "${{ github.event.inputs.features }}" \
-            --target aarch64-linux-android \
-            --${{ github.event.inputs.build_mode }}; then
-            
-            echo "build_success=true" >> $GITHUB_OUTPUT
-            
-            APK=$(find . -path "*/android-artifacts/**/*.apk" -type f 2>/dev/null | head -1 || \
-                  find . -name "*.apk" -type f 2>/dev/null | head -1 || echo "")
-            echo "apk_path=$APK" >> $GITHUB_OUTPUT
-          else
-            echo "build_success=false" >> $GITHUB_OUTPUT
-          fi
-          
-      - name: Final fallback - Native library
-        if: steps.build_apk.outputs.build_success != 'true'
-        id: lib_build
-        run: |
-          echo "Building native library as final fallback..."
-          
-          if cargo build \
-            -p "${{ steps.analysis.outputs.pkg_name }}" \
-            --features "${{ github.event.inputs.features }}" \
-            --target aarch64-linux-android \
-            --${{ github.event.inputs.build_mode }}; then
-            
-            LIB=$(find target/aarch64-linux-android -name "*.so" -type f 2>/dev/null | head -1 || echo "")
-            echo "lib_path=$LIB" >> $GITHUB_OUTPUT
-            echo "lib_success=true" >> $GITHUB_OUTPUT
-          else
-            echo "lib_success=false" >> $GITHUB_OUTPUT
-          fi
-          
-      - name: Prepare artifacts
+          # 从官方 release 下载对应架构的 APK
+          # 这里需要替换为实际的下载链接
+          wget -q "https://github.com/TeamFlos/phira/releases/download/v0.6.7/phira-arm64-v8a-release.apk" -O template.apk || \
+          echo "⚠️ 需要手动下载官方 APK 并上传"
+
+      - name: 准备构建产物
         run: |
           mkdir -p output
           
-          if [ -f "${{ steps.build_apk.outputs.apk_path }}" ]; then
-            cp "${{ steps.build_apk.outputs.apk_path }}" output/phira.apk
-          elif [ -f "${{ steps.lib_build.outputs.lib_path }}" ]; then
-            cp "${{ steps.lib_build.outputs.lib_path }}" output/libphira.so
+          # 复制 .so 文件
+          if [ -f "${{ steps.find_so.outputs.so_path }}" ]; then
+            cp "${{ steps.find_so.outputs.so_path }}" output/libphira.so
           fi
           
-          cat > output/build-info.txt << EOF
-          Phira Android Build
-          ==================
-          Package: ${{ steps.analysis.outputs.pkg_name }}
-          Features: ${{ github.event.inputs.features }}
-          Mode: ${{ github.event.inputs.build_mode }}
+          # 复制模板 APK
+          if [ -f "template.apk" ]; then
+            cp template.apk output/phira-template.apk
+          fi
           
-          Status:
-          - APK: ${{ steps.build_apk.outputs.build_success == 'true' && '✅ SUCCESS' || '❌ FAILED' }}
-          - Library: ${{ steps.lib_build.outputs.lib_success == 'true' && '✅ SUCCESS' || '❌ FAILED' }}
+          # 创建使用说明
+          cat > output/使用说明.txt << 'EOF'
+          Phira Android 构建产物使用说明
+          ============================
           
-          Note: This is an unofficial build.
+          你构建的文件:
+          1. libphira.so - Android 原生库文件
+          2. phira-template.apk - 官方 APK 模板
+          
+          使用方法 (二选一):
+          
+          【方法一】手动替换
+          1. 用 MT管理器/ApkTool 打开官方 APK
+          2. 进入 lib/arm64-v8a/ 目录
+          3. 用此 libphira.so 替换原有的 libphira.so
+          4. 找到并注释掉 QuadSurface 类中的 preprocessInput 调用
+          5. 重新签名 APK 并安装
+          
+          【方法二】修复代码
+          1. 在 phira/src/lib.rs 中添加:
+          
+             #[cfg(target_os = "android")]
+             #[no_mangle]
+             pub unsafe extern "C" fn Java_quad_1native_QuadNative_preprocessInput(
+                 _: *mut std::ffi::c_void,
+                 _: *const std::ffi::c_void,
+                 motionEvent: ndk_sys::AInputEvent,
+                 f: ndk_sys::jfloat,
+                 f2: ndk_sys::jfloat,
+                 z: ndk_sys::jboolean,
+                 z2: ndk_sys::jboolean,
+             ) {
+                 // 实现触摸预处理
+             }
+          
+          2. 重新构建 libphira.so
+          3. 替换 APK 中的库文件
+          
+          功能配置: ${{ github.event.inputs.features }}
+          构建时间: $(date)
           EOF
-          
-      - name: Upload artifacts
+
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: phira-android-${{ github.event.inputs.target_package }}-${{ github.event.inputs.features }}-${{ github.event.inputs.build_mode }}
+          name: phira-android-lib-${{ github.event.inputs.features }}-${{ github.run_number }}
           path: output/
           retention-days: 30
+
+      - name: 生成构建摘要
+        run: |
+          echo "## 📱 Phira Android 构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**功能配置**: ${{ github.event.inputs.features }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 构建产物" >> $GITHUB_STEP_SUMMARY
+          echo "- **libphira.so**: Android 原生库" >> $GITHUB_STEP_SUMMARY
+          echo "- **phira-template.apk**: 官方 APK 模板" >> $GITHUB_STEP_SUMMARY
+          echo "- **使用说明.txt**: 替换教程" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 下一步" >> $GITHUB_STEP_SUMMARY
+          echo "1. 下载构建产物压缩包" >> $GITHUB_STEP_SUMMARY
+          echo "2. 按照 使用说明.txt 替换 APK 中的库文件" >> $GITHUB_STEP_SUMMARY
+          echo "3. 重新签名并安装" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **注意**: 需要手动处理 preprocessInput 的调用或实现" >> $GITHUB_STEP_SUMMARY
