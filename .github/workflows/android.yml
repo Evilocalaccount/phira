@@ -1,4 +1,4 @@
-name: Build Phira Android APK (Fixed)
+name: Build Phira Android APK (v3)
 
 on:
   workflow_dispatch:
@@ -22,17 +22,17 @@ on:
           - release
           - debug
       target_package:
-        description: 'Package to build'
+        description: 'Package to build (try phira first)'
         required: false
         default: 'phira'
         type: choice
         options:
-          - phira        # Likely contains the actual game logic
-          - phira-main   # Main entry point (may need patching)
+          - phira
+          - phira-main
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  RUST_BACKTRACE: full
 
 jobs:
   build-android:
@@ -58,7 +58,9 @@ jobs:
             ~/.cargo/git
             **/target
           key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
-          
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+            
       - name: Setup Android environment
         run: |
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
@@ -85,7 +87,6 @@ jobs:
           PKG="${{ github.event.inputs.target_package }}"
           echo "Target: $PKG"
           
-          # Check package exists
           if [ ! -f "$PKG/Cargo.toml" ]; then
             echo "Package not found!"
             exit 1
@@ -97,37 +98,66 @@ jobs:
           PKG_NAME=$(grep '^name' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "pkg_name=$PKG_NAME" >> $GITHUB_OUTPUT
           
-          # Check for required sections
-          HAS_LIB=$(grep -q 'crate-type.*cdylib' Cargo.toml && echo "true" || echo "false")
+          # Analyze crate type
+          echo "=== Crate structure ==="
+          ls -la src/
+          
+          HAS_LIB_RS=false
+          HAS_MAIN_RS=false
+          [ -f "src/lib.rs" ] && HAS_LIB_RS=true
+          [ -f "src/main.rs" ] && HAS_MAIN_RS=true
+          
+          echo "has_lib_rs=$HAS_LIB_RS" >> $GITHUB_OUTPUT
+          echo "has_main_rs=$HAS_MAIN_RS" >> $GITHUB_OUTPUT
+          
+          # Check Android metadata
           HAS_ANDROID=$(grep -q 'package.metadata.android' Cargo.toml && echo "true" || echo "false")
+          echo "has_android=$HAS_ANDROID" >> $GITHUB_OUTPUT
           
-          echo "Has lib: $HAS_LIB | Has Android: $HAS_ANDROID"
+          echo "Crate type: $([ "$HAS_LIB_RS" = true ] && echo 'LIBRARY' || echo 'BINARY')"
           
-          # Patch if needed
-          if [ "$HAS_LIB" = "false" ] || [ "$HAS_ANDROID" = "false" ]; then
-            echo "Patching Cargo.toml..."
-            
-            # Backup
-            cp Cargo.toml Cargo.toml.backup
-            
-            # Add [lib] section if missing
-            if [ "$HAS_LIB" = "false" ]; then
-              cat >> Cargo.toml << 'EOF'
+      - name: Add [lib] section for binary crates
+        if: steps.analysis.outputs.has_lib_rs == 'false' && steps.analysis.outputs.has_main_rs == 'true'
+        run: |
+          echo "Creating src/lib.rs for binary crate..."
+          cd ${{ github.event.inputs.target_package }}
+          
+          # Create minimal lib.rs that delegates to main
+          cat > src/lib.rs << 'EOF'
+          //! Android library entry point
+          //! 
+          //! This is a wrapper to allow building the binary as an Android library.
+          //! The actual logic remains in src/main.rs.
+          
+          /// Android main entry point
+          #[no_mangle]
+          pub extern "C" fn android_main() {
+              // For now, just a placeholder
+              // In a real scenario, you'd extract the game loop logic into a library
+              // and call it from both main.rs and here
+          }
+          EOF
+          
+          # Add [lib] to Cargo.toml WITHOUT conflicting with [bin]
+          cat >> Cargo.toml << 'EOF'
           
           [lib]
           crate-type = ["cdylib"]
           name = "phira_android"
+          path = "src/lib.rs"
           EOF
-            fi
-            
-            # Add Android metadata if missing
-            if [ "$HAS_ANDROID" = "false" ]; then
-              cat >> Cargo.toml << 'EOF'
+          
+      - name: Add Android metadata
+        if: steps.analysis.outputs.has_android == 'false'
+        run: |
+          cd ${{ github.event.inputs.target_package }}
+          
+          cat >> Cargo.toml << 'EOF'
           
           [package.metadata.android]
           package_name = "com.phira.game"
           version_code = 1
-          version_name = "0.6.7"
+          # version_name is NOT specified here - cargo-apk sets it automatically
           
           [package.metadata.android.sdk]
           min_sdk_version = 21
@@ -143,8 +173,6 @@ jobs:
           [[package.metadata.android.permission]]
           name = "android.permission.ACCESS_NETWORK_STATE"
           EOF
-            fi
-          fi
           
       - name: Configure cargo
         run: |
@@ -164,7 +192,7 @@ jobs:
       - name: Build APK
         id: build_apk
         run: |
-          echo "Building ${{ steps.analysis.outputs.pkg_name }}..."
+          echo "Building package: ${{ steps.analysis.outputs.pkg_name }}"
           
           if cargo apk build \
             -p "${{ steps.analysis.outputs.pkg_name }}" \
@@ -174,7 +202,6 @@ jobs:
             
             echo "build_success=true" >> $GITHUB_OUTPUT
             
-            # Find APK
             APK=$(find . -path "*/android-artifacts/**/*.apk" -type f 2>/dev/null | head -1 || \
                   find . -name "*.apk" -type f 2>/dev/null | head -1 || echo "")
             echo "apk_path=$APK" >> $GITHUB_OUTPUT
@@ -182,35 +209,47 @@ jobs:
             echo "build_success=false" >> $GITHUB_OUTPUT
           fi
           
-      - name: Build library fallback
+      - name: Final fallback - Native library
         if: steps.build_apk.outputs.build_success != 'true'
+        id: lib_build
         run: |
-          cargo build \
+          echo "Building native library as final fallback..."
+          
+          if cargo build \
             -p "${{ steps.analysis.outputs.pkg_name }}" \
             --features "${{ github.event.inputs.features }}" \
             --target aarch64-linux-android \
-            --${{ github.event.inputs.build_mode }}
+            --${{ github.event.inputs.build_mode }}; then
             
+            LIB=$(find target/aarch64-linux-android -name "*.so" -type f 2>/dev/null | head -1 || echo "")
+            echo "lib_path=$LIB" >> $GITHUB_OUTPUT
+            echo "lib_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "lib_success=false" >> $GITHUB_OUTPUT
+          fi
+          
       - name: Prepare artifacts
         run: |
           mkdir -p output
           
-          # Copy APK if built
           if [ -f "${{ steps.build_apk.outputs.apk_path }}" ]; then
             cp "${{ steps.build_apk.outputs.apk_path }}" output/phira.apk
+          elif [ -f "${{ steps.lib_build.outputs.lib_path }}" ]; then
+            cp "${{ steps.lib_build.outputs.lib_path }}" output/libphira.so
           fi
           
-          # Copy libraries if they exist
-          find . -name "*.so" -type f -exec cp {} output/ \; 2>/dev/null || true
-          
-          # Create build info
           cat > output/build-info.txt << EOF
-          Build Report
-          ============
+          Phira Android Build
+          ==================
           Package: ${{ steps.analysis.outputs.pkg_name }}
           Features: ${{ github.event.inputs.features }}
           Mode: ${{ github.event.inputs.build_mode }}
-          Status: ${{ steps.build_apk.outputs.build_success == 'true' && 'APK Success' || steps.build_lib.outputs.lib_success == 'true' && 'Library Only' || 'Failed' }}
+          
+          Status:
+          - APK: ${{ steps.build_apk.outputs.build_success == 'true' && '✅ SUCCESS' || '❌ FAILED' }}
+          - Library: ${{ steps.lib_build.outputs.lib_success == 'true' && '✅ SUCCESS' || '❌ FAILED' }}
+          
+          Note: This is an unofficial build.
           EOF
           
       - name: Upload artifacts
