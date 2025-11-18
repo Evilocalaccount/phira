@@ -10,7 +10,7 @@ crate-type = ["lib", "cdylib"]
 [features]
 closed = ["prpr/closed"]
 video = ["prpr/video"]
-chat = []
+chat = ["dep:phira-mp-client"]
 aa = []
 event_debug = []
 
