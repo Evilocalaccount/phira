@@ -1,4 +1,4 @@
-name: 构建 Phira Android 原生库
+name: 构建 Phira Android 原生库 (修正版)
 
 on:
   workflow_dispatch:
@@ -31,11 +31,20 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev pkg-config
-
-      - name: 修复 prpr 库代码
-        run: |
-          # 删除第一行
+          
+          # 修复: 使用 libwebkit2gtk-4.1-dev 替代 4.0-dev (Ubuntu 24.04+)
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            libssl-dev \
+            pkg-config \
+            unzip \
+            wget
+          
+          # 官方步骤: 删除 prpr/src/lib.rs 第一行
           sed -i '1d' prpr/src/lib.rs
 
       - name: 下载静态库
@@ -52,7 +61,8 @@ jobs:
           mkdir -p $ANDROID_HOME
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip
           unzip -q commandlinetools-linux-8512546_latest.zip -d $ANDROID_HOME
-          echo y | $ANDROID_HOME/cmdline-tools/bin/sdkmanager --sdk_root=${ANDROID_HOME} "platform-tools" "build-tools;33.0.2" "platforms;android-35"
+          echo y | $ANDROID_HOME/cmdline-tools/bin/sdkmanager --sdk_root=${ANDROID_HOME} \
+            "platform-tools" "build-tools;33.0.2" "platforms;android-35"
 
       - name: 安装 Android NDK
         run: |
@@ -67,78 +77,56 @@ jobs:
 
       - name: 构建 Android 原生库
         run: |
-          cargo install cargo-ndk
           cd phira
+          cargo install cargo-ndk
           cargo ndk -t arm64-v8a -p 35 build --release --features "${{ github.event.inputs.features }}"
-
-      - name: 查找构建产物
-        id: find_so
-        run: |
-          SO_FILE=$(find target -name "libphira.so" -type f | head -1)
-          echo "so_path=$SO_FILE" >> $GITHUB_OUTPUT
-          echo "构建的库文件: $SO_FILE"
-
-      - name: 下载官方 APK 模板
-        run: |
-          # 从官方 release 下载对应架构的 APK
-          # 这里需要替换为实际的下载链接
-          wget -q "https://github.com/TeamFlos/phira/releases/download/v0.6.7/phira-arm64-v8a-release.apk" -O template.apk || \
-          echo "⚠️ 需要手动下载官方 APK 并上传"
 
       - name: 准备构建产物
         run: |
           mkdir -p output
-          
-          # 复制 .so 文件
-          if [ -f "${{ steps.find_so.outputs.so_path }}" ]; then
-            cp "${{ steps.find_so.outputs.so_path }}" output/libphira.so
+          SO_FILE=$(find target -name "libphira.so" -type f | head -1)
+          if [ -n "$SO_FILE" ]; then
+            cp "$SO_FILE" output/libphira.so
+            echo "✅ libphira.so 已复制到 output/"
           fi
+
+      - name: 创建使用说明
+        run: |
+          cat > output/使用说明.md << 'EOF'
+          # Phira Android 构建产物使用说明
           
-          # 复制模板 APK
-          if [ -f "template.apk" ]; then
-            cp template.apk output/phira-template.apk
-          fi
+          ## 构建产物
+          - **libphira.so**: Android 原生库文件
           
-          # 创建使用说明
-          cat > output/使用说明.txt << 'EOF'
-          Phira Android 构建产物使用说明
-          ============================
+          ## 使用方法 (二选一)
           
-          你构建的文件:
-          1. libphira.so - Android 原生库文件
-          2. phira-template.apk - 官方 APK 模板
+          ### 方法一: 手动替换
+          1. 从官方 Release 下载对应架构的 APK
+          2. 使用 MT管理器/ApkTool 解压 APK
+          3. 替换 `lib/arm64-v8a/libphira.so`
+          4. 用 Dex编辑器++ 打开 `classes.dex`
+          5. 找到 `QuadSurface` 类，注释/删除 `preprocessInput` 调用
+          6. 重新签名并安装
           
-          使用方法 (二选一):
+          ### 方法二: 添加 JNI 函数
+          在 `phira/src/lib.rs` 添加:
+          ```rust
+          #[cfg(target_os = "android")]
+          #[no_mangle]
+          pub unsafe extern "C" fn Java_quad_1native_QuadNative_preprocessInput(
+              _: *mut std::ffi::c_void,
+              _: *const std::ffi::c_void,
+              motionEvent: ndk_sys::AInputEvent,
+              f: ndk_sys::jfloat,
+              f2: ndk_sys::jfloat,
+              z: ndk_sys::jboolean,
+              z2: ndk_sys::jboolean,
+          ) {}
+          ```
+          然后重新构建 libphira.so
           
-          【方法一】手动替换
-          1. 用 MT管理器/ApkTool 打开官方 APK
-          2. 进入 lib/arm64-v8a/ 目录
-          3. 用此 libphira.so 替换原有的 libphira.so
-          4. 找到并注释掉 QuadSurface 类中的 preprocessInput 调用
-          5. 重新签名 APK 并安装
-          
-          【方法二】修复代码
-          1. 在 phira/src/lib.rs 中添加:
-          
-             #[cfg(target_os = "android")]
-             #[no_mangle]
-             pub unsafe extern "C" fn Java_quad_1native_QuadNative_preprocessInput(
-                 _: *mut std::ffi::c_void,
-                 _: *const std::ffi::c_void,
-                 motionEvent: ndk_sys::AInputEvent,
-                 f: ndk_sys::jfloat,
-                 f2: ndk_sys::jfloat,
-                 z: ndk_sys::jboolean,
-                 z2: ndk_sys::jboolean,
-             ) {
-                 // 实现触摸预处理
-             }
-          
-          2. 重新构建 libphira.so
-          3. 替换 APK 中的库文件
-          
-          功能配置: ${{ github.event.inputs.features }}
-          构建时间: $(date)
+          **功能配置**: ${{ github.event.inputs.features }}
+          **构建时间**: $(date)
           EOF
 
       - name: 上传构建产物
@@ -148,20 +136,18 @@ jobs:
           path: output/
           retention-days: 30
 
-      - name: 生成构建摘要
+      - name: 生成摘要
         run: |
-          echo "## 📱 Phira Android 构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "## 📱 Phira Android 原生库构建完成" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**功能配置**: ${{ github.event.inputs.features }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 构建产物" >> $GITHUB_STEP_SUMMARY
-          echo "- **libphira.so**: Android 原生库" >> $GITHUB_STEP_SUMMARY
-          echo "- **phira-template.apk**: 官方 APK 模板" >> $GITHUB_STEP_SUMMARY
-          echo "- **使用说明.txt**: 替换教程" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 产物" >> $GITHUB_STEP_SUMMARY
+          echo "- **libphira.so**: 原生库文件" >> $GITHUB_STEP_SUMMARY
+          echo "- **使用说明.md**: 详细替换教程" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🎯 下一步" >> $GITHUB_STEP_SUMMARY
-          echo "1. 下载构建产物压缩包" >> $GITHUB_STEP_SUMMARY
-          echo "2. 按照 使用说明.txt 替换 APK 中的库文件" >> $GITHUB_STEP_SUMMARY
-          echo "3. 重新签名并安装" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ **注意**: 需要手动处理 preprocessInput 的调用或实现" >> $GITHUB_STEP_SUMMARY
+          echo "1. 下载 Artifacts 压缩包" >> $GITHUB_STEP_SUMMARY
+          echo "2. 按照 使用说明.md 替换官方 APK" >> $GITHUB_STEP_SUMMARY
+          echo "3. 修复 preprocessInput 问题" >> $GITHUB_STEP_SUMMARY
+          echo "4. 重新签名安装" >> $GITHUB_STEP_SUMMARY
