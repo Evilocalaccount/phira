@@ -1,18 +1,8 @@
-name: 构建 Phira Android 原生库 (最终修复版)
+name: Build Android Phira
 
 on:
   workflow_dispatch:
-    inputs:
-      features:
-        description: '启用功能'
-        required: false
-        default: 'chat'
-        type: choice
-        options:
-          - chat
-          - chat,video
-          - chat,video,aa
-          - chat,video,aa,event_debug
+
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,143 +11,55 @@ env:
   ANDROID_NDK_ROOT: ${{github.workspace}}/android-ndk-r27c
 
 jobs:
-  build:
+  Build:
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4.2.2
+    - uses: actions/checkout@v4.2.2
+    
+    - run: |
+        sudo apt-get update
+        sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev pkg-config
+        sed -i '1d' prpr/src/lib.rs
+        
+    - name: Download static-lib
+      uses: suisei-cn/actions-download-file@v1.3.0
+      id: downlod-static-lib
+      with:
+        url: "https://teamflos.github.io/phira-docs/phira_build_guide/prpr-avc.zip"
+        target: ./
 
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev \
-            libssl-dev \
-            pkg-config \
-            unzip \
-            wget
-          sed -i '1d' prpr/src/lib.rs
+    - name: Set Up static-lib
+      run: |
+        unzip prpr-avc.zip -d ./
 
-      - name: 下载静态库
-        uses: suisei-cn/actions-download-file@v1.3.0
-        with:
-          url: "https://teamflos.github.io/phira-docs/phira_build_guide/prpr-avc.zip"
-          target: ./
+    - name: Install Android SDK Tools
+      run: |
+        wget https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip
+        unzip commandlinetools-linux-8512546_latest.zip -d $ANDROID_HOME
+        echo y | $ANDROID_HOME/cmdline-tools/bin/sdkmanager --sdk_root=${ANDROID_HOME} "platform-tools" "build-tools;33.0.2" "platforms;android-35"
 
-      - name: 解压静态库
-        run: unzip -q prpr-avc.zip -d ./
+    - name: Install Android NDK
+      run: |
+        wget https://googledownloads.cn/android/repository/android-ndk-r27c-linux.zip
+        unzip android-ndk-r27c-linux.zip -d ${{github.workspace}}
 
-      - name: 安装 Android SDK
-        run: |
-          mkdir -p $ANDROID_HOME
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip
-          unzip -q commandlinetools-linux-8512546_latest.zip -d $ANDROID_HOME
-          echo y | $ANDROID_HOME/cmdline-tools/bin/sdkmanager --sdk_root=${ANDROID_HOME} \
-            "platform-tools" "build-tools;33.0.2" "platforms;android-35"
-
-      - name: 安装 Android NDK
-        run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
-          unzip -q android-ndk-r27c-linux.zip -d ${{github.workspace}}
-
-      - name: 安装 Rust 工具链
-        uses: actions-rs/toolchain@v1.0.6
-        with:
-          toolchain: stable
-          target: aarch64-linux-android
-
-      - name: 安装 cargo-ndk
-        run: cargo install cargo-ndk --locked
-
-      - name: 构建 Android 原生库 (修复版)
-        run: |
-          cd phira
-          # 修复: cargo-ndk 4.x 版本不需要 -p 参数
-          # 正确的格式: cargo ndk -t arm64-v8a -p 35 build --release
-          # 但 -p 在 4.x 中已弃用，改用 --platform 或直接省略
-          cargo ndk --target arm64-v8a --platform 35 -- build --release --features "${{ github.event.inputs.features }}"
-
-      - name: 查找并保存 .so 文件
-        run: |
-          mkdir -p output
-          SO_FILE=$(find target/aarch64-linux-android -name "libphira.so" -type f | head -1)
-          if [ -n "$SO_FILE" ]; then
-            cp "$SO_FILE" output/libphira.so
-            echo "✅ libphira.so 已找到并复制: $SO_FILE"
-            ls -lh output/libphira.so
-          else
-            echo "❌ 未找到 libphira.so"
-            find target -name "*.so" -type f
-          fi
-
-      - name: 创建使用说明
-        run: |
-          cat > output/使用说明.md << 'EOF'
-          # Phira Android 构建产物使用说明
-          
-          ## 构建产物
-          - **libphira.so**: Android 原生库文件
-          
-          ## 使用方法 (二选一)
-          
-          ### 方法一: 手动替换（推荐）
-          1. 从 [Phira GitHub Releases](https://github.com/TeamFlos/phira/releases) 下载相同版本的官方 APK
-          2. 使用 **MT管理器** 或 **ApkTool** 解压官方 APK
-          3. 进入 `lib/arm64-v8a/` 目录
-          4. 用此 `libphira.so` 替换原有的 `libphira.so`
-          5. 用 **Dex编辑器++** 打开 `classes.dex`
-          6. 找到 `org/flos/phira/QuadSurface` 类，定位到第153行
-          7. 删除或注释掉 `preprocessInput` 相关的调用
-          8. 保存修改，重新签名 APK
-          9. 安装到设备
-          
-          ### 方法二: 添加 JNI 函数
-          在 `phira/src/lib.rs` 中添加以下代码：
-          ```rust
-          #[cfg(target_os = "android")]
-          #[no_mangle]
-          pub unsafe extern "C" fn Java_quad_1native_QuadNative_preprocessInput(
-              _: *mut std::ffi::c_void,
-              _: *const std::ffi::c_void,
-              motionEvent: ndk_sys::AInputEvent,
-              f: ndk_sys::jfloat,
-              f2: ndk_sys::jfloat,
-              z: ndk_sys::jboolean,
-              z2: ndk_sys::jboolean,
-          ) {
-              // 触摸事件预处理实现
-          }
-          ```
-          然后重新运行此工作流构建 libphira.so
-          
-          **功能配置**: ${{ github.event.inputs.features }}
-          **构建时间**: $(date)
-          EOF
-
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: phira-android-lib-${{ github.event.inputs.features }}-${{ github.run_number }}
-          path: output/
-          retention-days: 30
-
-      - name: 生成构建摘要
-        run: |
-          echo "## 📱 Phira Android 原生库构建完成" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**功能配置**: ${{ github.event.inputs.features }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 构建产物" >> $GITHUB_STEP_SUMMARY
-          echo "- **libphira.so**: 原生库文件" >> $GITHUB_STEP_SUMMARY
-          echo "- **使用说明.md**: 详细替换教程" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🎯 下一步操作" >> $GITHUB_STEP_SUMMARY
-          echo "1. 下载 Artifacts 压缩包" >> $GITHUB_STEP_SUMMARY
-          echo "2. 按照 使用说明.md 替换官方 APK" >> $GITHUB_STEP_SUMMARY
-          echo "3. 修复 preprocessInput 调用" >> $GITHUB_STEP_SUMMARY
-          echo "4. 重新签名并安装到设备" >> $GITHUB_STEP_SUMMARY
+    - name: Install Rust Toolchains
+      uses: actions-rs/toolchain@v1.0.6
+      with:
+        toolchain: stable
+        target: aarch64-linux-android
+    
+    - name: Build for Android
+      run: |
+        cd phira
+        cargo install cargo-ndk
+        cargo ndk -t arm64-v8a -p 35 build --release
+    
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-build
+        path: |
+          target/aarch64-linux-android/release/libphira.so
