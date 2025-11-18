@@ -66,7 +66,7 @@ walkdir = "2.5.0"
 zip = "4.0.0"
 zstd = "0.13"
 
-phira-mp-client = { git = "https://github.com/TeamFlos/phira-mp" }
+phira-mp-client = { git = "https://github.com/TeamFlos/phira-mp", optional = true }
 phira-mp-common = { git = "https://github.com/TeamFlos/phira-mp" }
 uuid = { version = "1.17.0", features = ["v4"] }
 logos = "0.15.0"
